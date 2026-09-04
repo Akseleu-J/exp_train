@@ -1,29 +1,5 @@
 """
 model_gdn2_100m.py -- GDN-2-only hybrid, ~100M parameters, byte-level (BPB).
-
-Deliberately stripped down vs the full project (model.py): NO Mamba2, NO
-MLA, NO MoE. Every sublayer is GDN-2 (atomic_ops.gdn2_pipeline's
-gdn2_pallas_forward_trainable -- forward Pallas A->B->C->D, backward fused
-Pallas B1-B5, both from your validated atomic_ops/ package). "Block delta"
-architecture (BlockDAR/BlockDARLayer/HybridDARAttention/IntraBlockAttention)
-is kept exactly as in the full project -- it's the DAG-of-blocks residual
-routing structure, independent of which sublayer type sits inside each
-block. Since there's no MoE here, each block's post-layer mixing step is
-just the DAR-accumulated residual (no extra FFN) -- see BlockDAR below.
-
-Byte-level vocab (256 byte values + no extra specials needed for raw BPB
-training) means the loss is directly bits-per-byte:
-    bpb = cross_entropy_nats / ln(2)
-No BPE tokenizer needed -- this matches the project roadmap's "scale to
-~100M using pure GDN-2 layers on TinyStories+TinyShakespeare+Kazakh" item,
-using byte-level BPB as the standard cross-dataset/cross-tokenizer metric.
-
-Sizing note: GDN-2 kernels (atomic_ops/gdn2_fwd.py, kernel_a_scores.py)
-hard-assert d_head == 128 (MXU tile) and seq_len % BT(=256) == 0. Given
-that constraint, d_model must be a multiple of 128. The config below
-(d_model=1024, n_heads=8, num_layers=12, layers_per_block=3) lands close
-to 100M -- exact count is printed at init time via `count_params`; tune
-`num_layers`/`d_model` if you need to hit a different target.
 """
 from __future__ import annotations
 
@@ -37,15 +13,12 @@ from flax import linen as nn
 from flax import struct
 
 from atomic_ops.gdn2_pipeline import gdn2_pallas_forward_trainable
-from atomic_ops.gdn2_fwd import BT as GDN2_PALLAS_BT if False else None  # placeholder, see below
 
-# atomic_ops.gdn2_fwd doesn't export BT directly at module level under that
-# name in every version of this package -- grab it defensively from the
-# config module instead (config.DEFAULT_CONFIG.bt), which is always present.
+# atomic_ops.gdn2_fwd doesn't export a chunk-size constant at module level,
+# so grab it from the config module instead (config.DEFAULT_CONFIG.bt),
+# which is always present.
 from atomic_ops.configs import DEFAULT_CONFIG as _GDN2_CFG
 GDN2_PALLAS_BT = _GDN2_CFG.bt
-
-
 # ==========================================================================
 # Model mesh plumbing (same pattern as the full project's model.py)
 # ==========================================================================
