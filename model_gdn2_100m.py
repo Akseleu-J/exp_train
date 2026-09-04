@@ -42,7 +42,7 @@ from atomic_ops.gdn2_fwd import BT as GDN2_PALLAS_BT if False else None  # place
 # atomic_ops.gdn2_fwd doesn't export BT directly at module level under that
 # name in every version of this package -- grab it defensively from the
 # config module instead (config.DEFAULT_CONFIG.bt), which is always present.
-from atomic_ops.config import DEFAULT_CONFIG as _GDN2_CFG
+from atomic_ops.configs import DEFAULT_CONFIG as _GDN2_CFG
 GDN2_PALLAS_BT = _GDN2_CFG.bt
 
 
