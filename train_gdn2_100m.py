@@ -1,6 +1,20 @@
 """
 train_gdn2_100m.py -- обучение FullGDN2BlockDeltaModel (~100M, byte-level,
 enwik8/BPB). Plateau-adaptive LR schedule: warmup -> peak -> reduce on plateau.
+
+ПАТЧ (двухстадийный pipeline, см. чат):
+  1. Эта стадия (STAGE 1, untied, 12 РАЗНЫХ слоёв) теперь реально пишет в
+     HF Hub через checkpointing.py (раньше был только локальный orbax --
+     make_manager/save_slot/upload_slot/download_slot существовали в
+     checkpointing.py, но НИКОГДА не импортировались отсюда). Два HF-слота:
+       - "gdn2_100m_untied/latest"   -- периодически, по времени
+       - "gdn2_100m_untied/best_val" -- при каждом улучшении val_bpb
+  2. По завершении обучения (успешном ИЛИ по auto-stop) этот файл
+     АВТОМАТИЧЕСКИ запускает train_gdn2_100m_tied_full.py -- вторую,
+     главную стадию: единый tied-блок, ПЕРЕИСПОЛЬЗУЮЩИЙ 100% исходных 12
+     слоёв (не только block_7, как в latent_reasoning_gdn2.py), применённый
+     n_reasoning_cycles раз подряд (recurrent-depth, в духе GPT-6 Astra).
+     Стадия 2 тянет веса именно из "gdn2_100m_untied/best_val".
 """
 from __future__ import annotations
 
@@ -23,6 +37,7 @@ from utils import path_to_str
 from diagnostics import (
     make_leaf_layer_map, param_layer_tags, build_leaf_stats_fn, build_leaf_raw_stats_fn,
 )
+from checkpointing import make_manager, save_slot, upload_slot, _HAS_HF
 
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
@@ -65,7 +80,7 @@ RUN_CONFIG = dict(
     seq_len=2048,
     micro_batch_size=8,
     accum_steps=4,
-    total_train_steps=4500,
+    total_train_steps=1500,   # ПАТЧ: 1500 -- согласовано со стадией 2 (compute-match бюджет)
     warmup_steps=300,
     peak_lr=2e-4,
     min_lr=1e-6,
@@ -87,6 +102,11 @@ RUN_CONFIG = dict(
 )
 
 CKPT_ROOT = "/kaggle/working/gdn2_100m_ckpt"
+
+# ПАТЧ: корневой префикс HF-слотов этой стадии. Стадия 2
+# (train_gdn2_100m_tied_full.py) читает ИМЕННО HF_ROOT + "/best_val".
+HF_ROOT = "gdn2_100m_untied"
+HF_LATEST_KEEP_N_STAGE1 = 1
 
 
 def load_config():
@@ -157,24 +177,9 @@ def batch_iterator(trimmed, idx_pool, batch_size, data_sharding, seed, shuffle=T
 
 # ==========================================================================
 # Plateau-adaptive schedule.
-#   - warmup: линейный рост 0 -> peak_lr
-#   - после warmup: peak_lr * current_multiplier
-#   - current_multiplier уменьшается вручную при обнаружении plateau
-#
-# ВАЖНО: эта функция вызывается на ЧИСТОМ Python-уровне (вне jit) каждый
-# эффективный шаг, чтобы получить конкретное скалярное значение lr, которое
-# затем передаётся в compiled_apply как обычный (трассируемый) аргумент.
-# Раньше lr передавался как Python-замыкание внутрь оптимизатора,
-# скомпилированного через jax.jit -- JAX трассирует такую лямбду только
-# один раз при первой компиляции и "замораживает" значение
-# current_lr_multiplier, бывшее на тот момент (1.0), навсегда. Plateau-reduce
-# после этого продолжал печататься в логах (лог считается вне jit), но
-# РЕАЛЬНЫЙ lr внутри optax.adamw никогда не менялся. Передача lr явным
-# трассируемым аргументом устраняет эту проблему.
 # ==========================================================================
 def make_plateau_schedule(peak_lr, warmup_steps):
     def schedule(step, multiplier):
-        """multiplier -- scalar (обычно float), управляется извне."""
         step = jnp.asarray(step, dtype=jnp.float32)
         multiplier = jnp.asarray(multiplier, dtype=jnp.float32)
         warmup_frac = jnp.clip(step / max(warmup_steps, 1), 0.0, 1.0)
@@ -206,6 +211,26 @@ def compute_bpb_loss(params, model, batch, deterministic, rngs=None):
     ce_nats = jnp.nan_to_num(ce_nats, nan=0.0, posinf=20.0, neginf=0.0)
     bpb = ce_nats / jnp.log(2.0)
     return ce_nats, bpb
+
+
+def _hf_checkpoint_slot(mngr, local_dir, hf_subdir, step, params, opt_state,
+                         best_val_loss, best_train_loss, train_loss=None, keep_last_n=1, tag=""):
+    """ПАТЧ: тонкая обёртка save_slot -> upload_slot, никогда не роняет
+    обучение (тот же 'молча продолжаем без HF' паттерн, что checkpointing.py
+    уже использует для W&B/HF login)."""
+    try:
+        save_slot(mngr, local_dir, step, params, opt_state, epoch=0,
+                   best_val_loss=best_val_loss, best_train_loss=best_train_loss,
+                   train_loss=train_loss)
+    except Exception as e:
+        print(f"[CKPT] ⚠️ Локальный save_slot ({tag}) не удался на шаге {step}: {e}")
+        return
+    if not _HAS_HF:
+        return
+    try:
+        upload_slot(local_dir, hf_subdir, step, msg=tag, keep_last_n=keep_last_n)
+    except Exception as e:
+        print(f"[HF] ⚠️ upload_slot ({tag}) не удался на шаге {step}: {e}")
 
 
 def main():
@@ -267,29 +292,14 @@ def main():
     # ---- optimizer: AdamW + plateau-adaptive schedule + clip ----
     lr_schedule = make_plateau_schedule(cfg_run["peak_lr"], cfg_run["warmup_steps"])
 
-    # inject_hyperparams должен оборачивать ФАБРИКУ transformации (функцию,
-    # которая по значению learning_rate строит optax.chain заново), а не
-    # уже готовый объект optax.chain(...) -- см. историю ошибки:
-    # "GradientTransformationExtraArgs(...) is not a callable object".
     def make_tx(learning_rate):
         return optax.chain(
             optax.clip_by_global_norm(cfg_run["grad_clip_norm"]),
             optax.adamw(learning_rate=learning_rate, weight_decay=cfg_run["weight_decay"]),
         )
 
-    # Начальное значение learning_rate здесь чисто формальное (для init) --
-    # реальное значение подставляется explicit-аргументом `lr` в apply_step
-    # на каждом шаге, см. ниже.
     tx = optax.inject_hyperparams(make_tx)(learning_rate=cfg_run["peak_lr"])
 
-    # ВАЖНО: abstract_params передаётся как настоящий аргумент eval_shape, а
-    # не через замыкание в zero-arg лямбде (как это было раньше:
-    # `jax.eval_shape(lambda: tx.init(abstract_params))`). В таком виде
-    # внутрь tx.init попадали бы буквальные объекты jax.ShapeDtypeStruct как
-    # обычные Python-значения (а не трассируемые abstract-tracers), и
-    # optax.tree.dtype(...) падал на jnp.asarray(ShapeDtypeStruct(...)) с
-    # TypeError. Передача аргументом заставляет eval_shape подставить
-    # корректные abstract-значения нужной формы/типа.
     opt_state_abstract = jax.eval_shape(tx.init, abstract_params)
     opt_state_sharding = jax.tree_util.tree_map_with_path(_shard_leaf, opt_state_abstract)
     opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
@@ -297,7 +307,7 @@ def main():
     # ---- plateau state (plain Python, обновляется после eval) ----
     current_lr_multiplier = 1.0
     evals_since_improvement = 0
-    cooldown_counter = 0          # шагов до конца cooldown
+    cooldown_counter = 0
     total_reduces_done = 0
 
     print(f"[LR-SCHEDULE] Plateau-adaptive: warmup=[0,{cfg_run['warmup_steps']}) "
@@ -356,11 +366,6 @@ def main():
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), avg_grads
         )
 
-        # `lr` приходит как обычный трассируемый аргумент jitted-функции (не
-        # Python-замыкание) -- поэтому меняется КАЖДЫЙ вызов вместе с
-        # изменением current_lr_multiplier снаружи. Подставляем его в
-        # hyperparams состояния перед tx.update, как задумано
-        # optax.inject_hyperparams.
         s = s._replace(hyperparams=dict(s.hyperparams, learning_rate=lr))
 
         updates, new_s = tx.update(avg_grads, s, p)
@@ -410,12 +415,21 @@ def main():
         out_shardings=(NamedSharding(mesh, P()), NamedSharding(mesh, P())),
     )
 
-    # ---- checkpoint manager ----
+    # ---- checkpoint managers: local retention (unchanged) + HF slots (ПАТЧ) ----
     mngr = ocp.CheckpointManager(
         os.path.join(CKPT_ROOT, "latest"),
         ocp.StandardCheckpointer(),
         ocp.CheckpointManagerOptions(max_to_keep=2, create=True, enable_async_checkpointing=False),
     )
+
+    hf_latest_dir = os.path.join(CKPT_ROOT, "hf_latest_slot")
+    hf_best_dir = os.path.join(CKPT_ROOT, "hf_best_val_slot")
+    mngr_hf_latest = make_manager(hf_latest_dir, max_to_keep=2)
+    mngr_hf_best = make_manager(hf_best_dir, max_to_keep=1)
+    if _HAS_HF:
+        print(f"[HF] Стадия 1 будет писать в '{HF_ROOT}/latest' и '{HF_ROOT}/best_val'.")
+    else:
+        print("[HF] ⚠️ HF недоступен -- стадия 1 сохраняет только локально (orbax).")
 
     global _run
     if _HAS_WANDB:
@@ -433,7 +447,7 @@ def main():
 
     _micro_bpb_acc, _micro_grad_norm_acc = [], []
 
-    print("[TRAIN] 🚀 Старт обучения. Plateau-adaptive LR. Каждый эффективный шаг -- полная диагностика.")
+    print("[TRAIN] 🚀 Старт обучения (СТАДИЯ 1 / untied). Plateau-adaptive LR.")
 
     micro_step = 0
     while global_step < cfg_run["total_train_steps"]:
@@ -446,10 +460,6 @@ def main():
         micro_step += 1
 
         if micro_step % accum_steps == 0:
-            # lr считается на Python-уровне ДО вызова compiled_apply и
-            # передаётся как явный аргумент -- это то самое значение, которое
-            # реально применится внутри optax.adamw на этом шаге (см.
-            # комментарий у make_plateau_schedule).
             next_step_for_lr = global_step + 1
             cur_lr = float(jax.device_get(lr_schedule(next_step_for_lr, current_lr_multiplier)))
             lr_arr = jax.device_put(jnp.asarray(cur_lr, dtype=jnp.float32), scalar_sharding)
@@ -464,7 +474,6 @@ def main():
             step_finite = bool(jax.device_get(is_finite))
             global_step += 1
 
-            # cooldown считаем в шагах (не eval-ах)
             if cooldown_counter > 0:
                 cooldown_counter -= 1
 
@@ -518,6 +527,11 @@ def main():
                       f"Сохраняю и останавливаюсь.")
                 mngr.save(global_step, args=ocp.args.StandardSave({"params": params, "opt_state": opt_state}))
                 mngr.wait_until_finished()
+                _hf_checkpoint_slot(
+                    mngr_hf_latest, hf_latest_dir, f"{HF_ROOT}/latest", global_step,
+                    params, opt_state, best_val_bpb, best_val_bpb,
+                    keep_last_n=HF_LATEST_KEEP_N_STAGE1, tag="auto_stop",
+                )
                 wandb_log(global_step, {"train/auto_stopped": 1})
                 break
 
@@ -537,6 +551,13 @@ def main():
                     best_val_bpb = val_bpb
                     evals_since_improvement = 0
                     print(f"[EVAL] Step {global_step}: val_bpb={val_bpb:.4f} 🟢 УЛУЧШЕНИЕ (best={best_val_bpb:.4f})")
+                    # ПАТЧ: каждое улучшение val -> локальный save_slot + HF upload_slot
+                    # в "gdn2_100m_untied/best_val" -- ИМЕННО отсюда стадия 2 тянет веса.
+                    _hf_checkpoint_slot(
+                        mngr_hf_best, hf_best_dir, f"{HF_ROOT}/best_val", global_step,
+                        params, opt_state, best_val_bpb, best_val_bpb,
+                        train_loss=mean_bpb, keep_last_n=1, tag=f"val_bpb={val_bpb:.4f}",
+                    )
                 else:
                     evals_since_improvement += 1
                     print(f"[EVAL] Step {global_step}: val_bpb={val_bpb:.4f} 🔴 Нет улучшения "
@@ -544,18 +565,13 @@ def main():
 
                 wandb_log(global_step, {"eval/val_bpb": val_bpb, "eval/best_val_bpb": best_val_bpb})
 
-                if improved:
-                    wandb_log(global_step, {"eval/best_val_bpb": best_val_bpb})
-
                 # --- plateau check (только вне cooldown) ---
-                plateau_triggered = False
                 if cooldown_counter == 0 and evals_since_improvement >= cfg_run["patience"]:
                     new_multiplier = current_lr_multiplier * cfg_run["lr_reduce_factor"]
                     if new_multiplier * cfg_run["peak_lr"] >= cfg_run["min_lr"]:
                         current_lr_multiplier = new_multiplier
                         cooldown_counter = cfg_run["lr_cooldown_steps"]
                         total_reduces_done += 1
-                        plateau_triggered = True
                         print(f"[PLATEAU] ⬇️ LR reduce #{total_reduces_done}: multiplier={current_lr_multiplier:.4f} "
                               f"new_lr={cfg_run['peak_lr']*current_lr_multiplier:.2e} "
                               f"cooldown={cooldown_counter} шагов")
@@ -569,7 +585,7 @@ def main():
                               f"дальнейшее снижение заблокировано.")
                         wandb_log(global_step, {"train/min_lr_reached": 1})
 
-            # ---- checkpoint по времени ----
+            # ---- checkpoint по времени (local + HF "latest") ----
             now = time.perf_counter()
             if now - last_ckpt_time >= cfg_run["ckpt_every_seconds"]:
                 mngr.save(global_step, args=ocp.args.StandardSave({"params": params, "opt_state": opt_state}))
@@ -581,11 +597,28 @@ def main():
                         "lr_multiplier": current_lr_multiplier,
                         "total_lr_reduces": total_reduces_done,
                     }, f)
+                _hf_checkpoint_slot(
+                    mngr_hf_latest, hf_latest_dir, f"{HF_ROOT}/latest", global_step,
+                    params, opt_state, best_val_bpb, best_val_bpb,
+                    train_loss=mean_bpb, keep_last_n=HF_LATEST_KEEP_N_STAGE1, tag="periodic",
+                )
                 print(f"[CKPT] Сохранено на шаге {global_step}")
                 last_ckpt_time = now
 
     print(f"[DONE] Обучение завершено на шаге {global_step}. best_val_bpb={best_val_bpb:.4f} "
           f"final_lr_mult={current_lr_multiplier:.4f} total_reduces={total_reduces_done}")
+
+    # ПАТЧ: финальный best_val/latest апдейт на HF (гарантирует, что стадия 2
+    # всегда найдёт хотя бы один чекпоинт, даже если последний eval не улучшил best).
+    _hf_checkpoint_slot(
+        mngr_hf_latest, hf_latest_dir, f"{HF_ROOT}/latest", global_step,
+        params, opt_state, best_val_bpb, best_val_bpb,
+        keep_last_n=HF_LATEST_KEEP_N_STAGE1, tag="final",
+    )
+    if best_val_bpb == float("inf"):
+        print("[HF] ⚠️ best_val_bpb никогда не улучшался (inf) -- 'best_val' слот может "
+              "быть пуст. Стадия 2 в этом случае должна использовать 'latest'.")
+
     if _HAS_WANDB and _run is not None:
         wandb.summary["final/best_val_bpb"] = best_val_bpb
         wandb.summary["final/global_step"] = global_step
@@ -593,6 +626,22 @@ def main():
         wandb.summary["final/total_lr_reduces"] = total_reduces_done
         wandb.finish()
 
+    return {"global_step": global_step, "best_val_bpb": best_val_bpb}
+
 
 if __name__ == "__main__":
-    main()
+    stage1_result = main()
+
+    # ПАТЧ: автоматический запуск СТАДИИ 2 (главная цель) -- полностью
+    # weight-tied модель, ПЕРЕИСПОЛЬЗУЮЩАЯ 100% из 12 исходных слоёв как
+    # ОДИН блок, применённый n_reasoning_cycles раз (recurrent-depth,
+    # GPT-6 Astra-style). Импорт после стадии 1, а не в шапке файла --
+    # если стадия 2 сама завалится импортом (например, нет reasoning-
+    # датасета/HF), это не должно ронять уже сделанную работу стадии 1.
+    print("\n[PIPELINE] ➡️ Стадия 1 завершена, запускаю СТАДИЮ 2 (tied, 100% слоёв, recurrent-depth)...")
+    try:
+        import train_gdn2_100m_tied_full
+        train_gdn2_100m_tied_full.main()
+    except Exception as e:
+        print(f"[PIPELINE] ❌ Стадия 2 не запустилась: {type(e).__name__}: {e}")
+        print("[PIPELINE] Запустите её вручную: python train_gdn2_100m_tied_full.py")
