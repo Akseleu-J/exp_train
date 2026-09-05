@@ -94,6 +94,50 @@ COMPUTE_MATCH_R = 4          # соответствует вашему теку�
 # r_curve: набор R для отдельных с-нуля прогонов
 R_CURVE_VALUES = [2, 4, 8, 12]
 
+# ==========================================================================
+# TIED-специфичные поправки к RUN_CONFIG.
+#
+# Почему нужны отдельно от COMMON (см. диагноз в чате): у tied-модели ОДИН
+# набор весов получает накопленный градиентный сигнал от ВСЕХ R применений
+# сразу (в отличие от untied, где каждый блок получает свой независимый,
+# в R раз "разбавленный" по объёму сигнал). При той же peak_lr/warmup, что
+# у untied, это даёт NaN уже на первых шагах (см. лог: AUTO-STOP на шаге 4,
+# best_val_bpb=inf -- эффективный градиент разошёлся ДО первого eval).
+# Классический эффект weight-tying (ALBERT/Universal Transformer используют
+# меньший LR и/или длиннее warmup, чем untied-аналоги того же размера).
+#
+# TIED_LR_SCALE=1/R -- грубая, но рабочая первая эвристика: компенсировать
+# рост эффективного градиентного сигнала уменьшением lr пропорционально R.
+# TIED_WARMUP_MULT -- длиннее warmup, чтобы дать Adam's second-moment
+# оценкам "устаканиться" при более резком градиентном ландшафте.
+# TIED_GRAD_CLIP -- ниже, чем у untied, дополнительная подстраховка (клип
+# не спасает от уже-NaN значений, но снижает риск дойти до NaN на ранних
+# шагах, пока веса ещё далеки от разумных).
+# ==========================================================================
+TIED_LR_SCALE = 1.0 / COMPUTE_MATCH_R
+TIED_WARMUP_MULT = 2.0
+TIED_GRAD_CLIP = 0.3
+
+# Если True -- НЕ переобучаем untied baseline заново (compute_match режим),
+# а берём уже полученное значение ниже. Обновите UNTIED_BASELINE_BPB
+# значением из вашего предыдущего прогона ПЕРЕД тем, как ставить флаг True.
+SKIP_UNTIED_BASELINE = True
+UNTIED_BASELINE_BPB = 1.6107
+UNTIED_BASELINE_N_PARAMS = 125_300_000
+
+# Сколько ПЕРВЫХ эффективных шагов печатать построчную диагностику
+# (bpb/ce/grad_norm) независимо от eval_every_steps -- чтобы увидеть, на
+# каком именно шаге начинается расхождение, а не только итог AUTO-STOP.
+DEBUG_FIRST_N_STEPS = 20
+
+
+def make_tied_run_cfg(common: dict) -> dict:
+    cfg = dict(common)
+    cfg["peak_lr"] = common["peak_lr"] * TIED_LR_SCALE
+    cfg["warmup_steps"] = int(common["warmup_steps"] * TIED_WARMUP_MULT)
+    cfg["grad_clip_norm"] = TIED_GRAD_CLIP
+    return cfg
+
 
 def cosine_schedule(step, peak_lr, warmup_steps, total_steps, min_lr):
     step = jnp.asarray(step, dtype=jnp.float32)
@@ -271,6 +315,12 @@ def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_id
             )
             step_finite = bool(jax.device_get(is_finite))
             global_step += 1
+
+            if global_step <= run_cfg.get("debug_first_n_steps", 0):
+                gn_val = float(jax.device_get(global_norm))
+                print(f"    [DEBUG {run_name} step {global_step}] lr={cur_lr:.3e} "
+                      f"global_grad_norm={gn_val:.6e} finite={step_finite}")
+
             nonfinite_window.append(0 if step_finite else 1)
             nonfinite_consecutive = 0 if step_finite else nonfinite_consecutive + 1
             window_ratio = sum(nonfinite_window) / len(nonfinite_window)
@@ -330,14 +380,29 @@ def main():
 
     if RUN_MODE == "compute_match":
         R = COMPUTE_MATCH_R
-        # untied baseline: num_layers = R * layers_per_block -> R блоков, разные веса
-        model_u, cfg_u = build_model(tied=False, num_layers=R * BASE_MODEL_KW["layers_per_block"], n_cycles=R)
-        res_u = train_one_run(f"untied_R{R}", model_u, cfg_u, COMMON, trimmed, train_idx, val_idx, mesh, n_devices)
+        tied_run_cfg = dict(make_tied_run_cfg(COMMON), debug_first_n_steps=DEBUG_FIRST_N_STEPS)
+
+        if SKIP_UNTIED_BASELINE:
+            print(f"[SKIP] untied_R{R} пропущен, использую кэшированный результат: "
+                  f"best_val_bpb={UNTIED_BASELINE_BPB}")
+            res_u = {
+                "run_name": f"untied_R{R}", "n_params": UNTIED_BASELINE_N_PARAMS,
+                "best_val_bpb": UNTIED_BASELINE_BPB, "final_step": None, "history": [],
+            }
+        else:
+            # untied baseline: num_layers = R * layers_per_block -> R блоков, разные веса
+            model_u, cfg_u = build_model(tied=False, num_layers=R * BASE_MODEL_KW["layers_per_block"], n_cycles=R)
+            untied_run_cfg = dict(COMMON, debug_first_n_steps=DEBUG_FIRST_N_STEPS)
+            res_u = train_one_run(f"untied_R{R}", model_u, cfg_u, untied_run_cfg, trimmed, train_idx, val_idx, mesh, n_devices)
         results.append(res_u)
 
-        # tied: тот же R применений одного и того же блока
+        # tied: тот же R применений одного и того же блока, СВОЙ (более
+        # мягкий) run_cfg -- см. TIED_LR_SCALE/TIED_WARMUP_MULT/TIED_GRAD_CLIP
+        # выше и диагноз в чате (untied и tied НЕ должны делить один и тот
+        # же peak_lr/warmup -- у tied эффективный градиентный сигнал на
+        # общие веса в R раз плотнее).
         model_t, cfg_t = build_model(tied=True, num_layers=BASE_MODEL_KW["layers_per_block"], n_cycles=R)
-        res_t = train_one_run(f"tied_R{R}", model_t, cfg_t, COMMON, trimmed, train_idx, val_idx, mesh, n_devices)
+        res_t = train_one_run(f"tied_R{R}", model_t, cfg_t, tied_run_cfg, trimmed, train_idx, val_idx, mesh, n_devices)
         results.append(res_t)
 
         print("\n===== H2 COMPUTE-MATCH РЕЗУЛЬТАТ =====")
@@ -345,13 +410,19 @@ def main():
         print(f"tied   (R={R}, {res_t['n_params']/1e6:.1f}M params): best_val_bpb={res_t['best_val_bpb']:.4f}")
         gap = res_t["best_val_bpb"] - res_u["best_val_bpb"]
         print(f"gap (tied - untied) = {gap:+.4f} bpb")
-        print("Малый gap -> H2 подтверждена на этом бюджете (recurrent depth ~ valid substitute).")
-        print("Большой gap -> уникальные веса на слой всё ещё важны на этом масштабе.")
+        if res_t["best_val_bpb"] == float("inf"):
+            print("⚠️ tied снова разошёлся (inf) -- ещё сильнее понизьте TIED_LR_SCALE "
+                  "(например до 1/(2*R)) или увеличьте TIED_WARMUP_MULT, прежде чем "
+                  "делать выводы про H2.")
+        else:
+            print("Малый gap -> H2 подтверждена на этом бюджете (recurrent depth ~ valid substitute).")
+            print("Большой gap -> уникальные веса на слой всё ещё важны на этом масштабе.")
 
     elif RUN_MODE == "r_curve":
+        tied_run_cfg = dict(make_tied_run_cfg(COMMON), debug_first_n_steps=DEBUG_FIRST_N_STEPS)
         for R in R_CURVE_VALUES:
             model_t, cfg_t = build_model(tied=True, num_layers=BASE_MODEL_KW["layers_per_block"], n_cycles=R)
-            res = train_one_run(f"tied_Rcurve_R{R}", model_t, cfg_t, COMMON, trimmed, train_idx, val_idx, mesh, n_devices)
+            res = train_one_run(f"tied_Rcurve_R{R}", model_t, cfg_t, tied_run_cfg, trimmed, train_idx, val_idx, mesh, n_devices)
             results.append(res)
 
         print("\n===== H2 R-CURVE РЕЗУЛЬТАТ =====")
