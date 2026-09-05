@@ -160,6 +160,17 @@ def batch_iterator(trimmed, idx_pool, batch_size, data_sharding, seed, shuffle=T
 #   - warmup: линейный рост 0 -> peak_lr
 #   - после warmup: peak_lr * current_multiplier
 #   - current_multiplier уменьшается вручную при обнаружении plateau
+#
+# ВАЖНО: эта функция вызывается на ЧИСТОМ Python-уровне (вне jit) каждый
+# эффективный шаг, чтобы получить конкретное скалярное значение lr, которое
+# затем передаётся в compiled_apply как обычный (трассируемый) аргумент.
+# Раньше lr передавался как Python-замыкание внутрь оптимизатора,
+# скомпилированного через jax.jit -- JAX трассирует такую лямбду только
+# один раз при первой компиляции и "замораживает" значение
+# current_lr_multiplier, бывшее на тот момент (1.0), навсегда. Plateau-reduce
+# после этого продолжал печататься в логах (лог считается вне jit), но
+# РЕАЛЬНЫЙ lr внутри optax.adamw никогда не менялся. Передача lr явным
+# трассируемым аргументом устраняет эту проблему.
 # ==========================================================================
 def make_plateau_schedule(peak_lr, warmup_steps):
     def schedule(step, multiplier):
@@ -217,6 +228,7 @@ def main():
     model = FullGDN2BlockDeltaModel(cfg=model_cfg)
 
     data_sharding = NamedSharding(mesh, P("tpu_nodes", None))
+    scalar_sharding = NamedSharding(mesh, P())
 
     # ---- init params ----
     init_rng = jax.random.PRNGKey(cfg_run["seed"])
@@ -255,16 +267,30 @@ def main():
     # ---- optimizer: AdamW + plateau-adaptive schedule + clip ----
     lr_schedule = make_plateau_schedule(cfg_run["peak_lr"], cfg_run["warmup_steps"])
 
-    # optax требует callable(step) -> lr. Оборачиваем: замыкаем current_multiplier
-    # как nonlocal и пересоздаём tx при каждом изменении multiplier.
-    # Проще: используем optax.inject_hyperparams, чтобы менять lr "извне".
-    tx_base = optax.chain(
-        optax.clip_by_global_norm(cfg_run["grad_clip_norm"]),
-        optax.adamw(learning_rate=1.0, weight_decay=cfg_run["weight_decay"]),  # lr=1.0, масштабируем снаружи
-    )
-    tx = optax.inject_hyperparams(tx_base)(learning_rate=lambda step: lr_schedule(step, current_lr_multiplier))
+    # inject_hyperparams должен оборачивать ФАБРИКУ transformации (функцию,
+    # которая по значению learning_rate строит optax.chain заново), а не
+    # уже готовый объект optax.chain(...) -- см. историю ошибки:
+    # "GradientTransformationExtraArgs(...) is not a callable object".
+    def make_tx(learning_rate):
+        return optax.chain(
+            optax.clip_by_global_norm(cfg_run["grad_clip_norm"]),
+            optax.adamw(learning_rate=learning_rate, weight_decay=cfg_run["weight_decay"]),
+        )
 
-    opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
+    # Начальное значение learning_rate здесь чисто формальное (для init) --
+    # реальное значение подставляется explicit-аргументом `lr` в apply_step
+    # на каждом шаге, см. ниже.
+    tx = optax.inject_hyperparams(make_tx)(learning_rate=cfg_run["peak_lr"])
+
+    # ВАЖНО: abstract_params передаётся как настоящий аргумент eval_shape, а
+    # не через замыкание в zero-arg лямбде (как это было раньше:
+    # `jax.eval_shape(lambda: tx.init(abstract_params))`). В таком виде
+    # внутрь tx.init попадали бы буквальные объекты jax.ShapeDtypeStruct как
+    # обычные Python-значения (а не трассируемые abstract-tracers), и
+    # optax.tree.dtype(...) падал на jnp.asarray(ShapeDtypeStruct(...)) с
+    # TypeError. Передача аргументом заставляет eval_shape подставить
+    # корректные abstract-значения нужной формы/типа.
+    opt_state_abstract = jax.eval_shape(tx.init, abstract_params)
     opt_state_sharding = jax.tree_util.tree_map_with_path(_shard_leaf, opt_state_abstract)
     opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
 
@@ -317,7 +343,7 @@ def main():
                         NamedSharding(mesh, P()), NamedSharding(mesh, P())),
     )
 
-    def apply_step(p, s, accum_grads, n_accum):
+    def apply_step(p, s, accum_grads, n_accum, lr):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
 
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
@@ -329,6 +355,14 @@ def main():
         avg_grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), avg_grads
         )
+
+        # `lr` приходит как обычный трассируемый аргумент jitted-функции (не
+        # Python-замыкание) -- поэтому меняется КАЖДЫЙ вызов вместе с
+        # изменением current_lr_multiplier снаружи. Подставляем его в
+        # hyperparams состояния перед tx.update, как задумано
+        # optax.inject_hyperparams.
+        s = s._replace(hyperparams=dict(s.hyperparams, learning_rate=lr))
+
         updates, new_s = tx.update(avg_grads, s, p)
         new_p_candidate = optax.apply_updates(p, updates)
         new_p_candidate = jax.tree_util.tree_map(
@@ -355,7 +389,8 @@ def main():
     compiled_apply = jax.jit(
         apply_step,
         donate_argnums=(0, 1, 2),
-        in_shardings=(param_sharding, opt_state_sharding, param_sharding, NamedSharding(mesh, P())),
+        in_shardings=(param_sharding, opt_state_sharding, param_sharding,
+                       NamedSharding(mesh, P()), scalar_sharding),
         out_shardings=(
             param_sharding, opt_state_sharding, param_sharding,
             NamedSharding(mesh, P()), NamedSharding(mesh, P()),
@@ -411,11 +446,19 @@ def main():
         micro_step += 1
 
         if micro_step % accum_steps == 0:
+            # lr считается на Python-уровне ДО вызова compiled_apply и
+            # передаётся как явный аргумент -- это то самое значение, которое
+            # реально применится внутри optax.adamw на этом шаге (см.
+            # комментарий у make_plateau_schedule).
+            next_step_for_lr = global_step + 1
+            cur_lr = float(jax.device_get(lr_schedule(next_step_for_lr, current_lr_multiplier)))
+            lr_arr = jax.device_put(jnp.asarray(cur_lr, dtype=jnp.float32), scalar_sharding)
+
             (params, opt_state, accum_grads, is_finite, global_norm,
              layer_grad_norms, layer_grad_maxabs, layer_grad_nonfinite,
              layer_grad_raw_maxabs, layer_grad_nonfinite_count,
              layer_w_norms, layer_w_maxabs, layer_w_nonfinite) = compiled_apply(
-                params, opt_state, accum_grads, accum_steps
+                params, opt_state, accum_grads, accum_steps, lr_arr
             )
 
             step_finite = bool(jax.device_get(is_finite))
@@ -424,8 +467,6 @@ def main():
             # cooldown считаем в шагах (не eval-ах)
             if cooldown_counter > 0:
                 cooldown_counter -= 1
-
-            cur_lr = float(jax.device_get(lr_schedule(global_step, current_lr_multiplier)))
 
             nonfinite_window.append(0 if step_finite else 1)
             nonfinite_consecutive = 0 if step_finite else nonfinite_consecutive + 1
