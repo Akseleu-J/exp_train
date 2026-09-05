@@ -117,6 +117,7 @@ def build_model(tied: bool, num_layers: int, n_cycles: int):
 
 def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_idx, mesh, n_devices):
     data_sharding = NamedSharding(mesh, P("tpu_nodes", None))
+    scalar_sharding = NamedSharding(mesh, P())
     init_rng = jax.random.PRNGKey(run_cfg["seed"])
 
     abstract_params = jax.eval_shape(
@@ -143,16 +144,23 @@ def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_id
     n_params = count_params(params)
     print(f"[{run_name}] Параметров: {n_params:,} (≈{n_params/1e6:.1f}M)")
 
-    tx_base = optax.chain(
-        optax.clip_by_global_norm(run_cfg["grad_clip_norm"]),
-        optax.adamw(learning_rate=1.0, weight_decay=run_cfg["weight_decay"]),
-    )
-    lr_fn = lambda step: cosine_schedule(
-        step, run_cfg["peak_lr"], run_cfg["warmup_steps"], run_cfg["total_train_steps"], run_cfg["min_lr"]
-    )
-    tx = optax.inject_hyperparams(tx_base)(learning_rate=lr_fn)
+    # ФИКС (тот же, что в train_gdn2_100m.py): inject_hyperparams должен
+    # оборачивать ФАБРИКУ трансформации (функцию learning_rate -> tx), а не
+    # готовый optax.chain(...) с lr-замыканием внутри jit -- иначе JAX
+    # трассирует лямбду один раз при компиляции и "замораживает" lr на
+    # начальном значении навсегда (реальный lr внутри optax.adamw после
+    # этого никогда не меняется, хотя расписание печатается в логах верно).
+    # Здесь используем lr явным трассируемым аргументом apply_step, cosine
+    # расписание считается на Python-уровне ДО вызова compiled_apply.
+    def make_tx(learning_rate):
+        return optax.chain(
+            optax.clip_by_global_norm(run_cfg["grad_clip_norm"]),
+            optax.adamw(learning_rate=learning_rate, weight_decay=run_cfg["weight_decay"]),
+        )
 
-    opt_state_abstract = jax.eval_shape(lambda: tx.init(abstract_params))
+    tx = optax.inject_hyperparams(make_tx)(learning_rate=run_cfg["peak_lr"])
+
+    opt_state_abstract = jax.eval_shape(tx.init, abstract_params)
     opt_state_sharding = jax.tree_util.tree_map_with_path(_shard_leaf, opt_state_abstract)
     opt_state = jax.jit(lambda p: tx.init(p), out_shardings=opt_state_sharding)(params)
 
@@ -186,13 +194,16 @@ def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_id
         out_shardings=(param_sharding, NamedSharding(mesh, P()), NamedSharding(mesh, P())),
     )
 
-    def apply_step(p, s, accum_grads, n_accum):
+    def apply_step(p, s, accum_grads, n_accum, lr):
         avg_grads = jax.tree_util.tree_map(lambda g: g / n_accum, accum_grads)
         global_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(avg_grads)))
         is_finite = jnp.isfinite(global_norm)
         avg_grads = jax.tree_util.tree_map(
             lambda g: jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), avg_grads
         )
+        # lr приходит как обычный трассируемый аргумент -- подставляем в
+        # hyperparams состояния перед tx.update (см. комментарий выше).
+        s = s._replace(hyperparams=dict(s.hyperparams, learning_rate=lr))
         updates, new_s = tx.update(avg_grads, s, p)
         new_p_candidate = optax.apply_updates(p, updates)
         new_p_candidate = jax.tree_util.tree_map(
@@ -209,7 +220,8 @@ def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_id
     compiled_apply = jax.jit(
         apply_step,
         donate_argnums=(0, 1, 2),
-        in_shardings=(param_sharding, opt_state_sharding, param_sharding, NamedSharding(mesh, P())),
+        in_shardings=(param_sharding, opt_state_sharding, param_sharding,
+                       NamedSharding(mesh, P()), scalar_sharding),
         out_shardings=(param_sharding, opt_state_sharding, param_sharding,
                         NamedSharding(mesh, P()), NamedSharding(mesh, P())),
     )
@@ -244,8 +256,18 @@ def train_one_run(run_name: str, model, cfg, run_cfg, trimmed, train_idx, val_id
         micro_step += 1
 
         if micro_step % accum_steps == 0:
+            # lr считается на Python-уровне ДО compiled_apply и передаётся
+            # явным трассируемым аргументом -- то самое значение, которое
+            # реально применится внутри optax.adamw на этом шаге.
+            next_step_for_lr = global_step + 1
+            cur_lr = float(cosine_schedule(
+                next_step_for_lr, run_cfg["peak_lr"], run_cfg["warmup_steps"],
+                run_cfg["total_train_steps"], run_cfg["min_lr"],
+            ))
+            lr_arr = jax.device_put(jnp.asarray(cur_lr, dtype=jnp.float32), scalar_sharding)
+
             params, opt_state, accum_grads, is_finite, global_norm = compiled_apply(
-                params, opt_state, accum_grads, accum_steps
+                params, opt_state, accum_grads, accum_steps, lr_arr
             )
             step_finite = bool(jax.device_get(is_finite))
             global_step += 1
