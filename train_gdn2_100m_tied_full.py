@@ -39,7 +39,7 @@ from model_gdn2_100m_tied import FullGDN2BlockDeltaModelTied, TiedModelConfig
 from train_gdn2_100m import (
     load_config as load_stage1_config,
     load_enwik8_bytes, make_chunked_dataset, batch_iterator, make_tpu_mesh,
-    compute_bpb_loss, HF_ROOT as STAGE1_HF_ROOT,
+    HF_ROOT as STAGE1_HF_ROOT,
 )
 from checkpointing import make_manager, save_slot, upload_slot, download_slot, _HAS_HF
 
@@ -82,6 +82,32 @@ RUN_CONFIG_TIED = dict(
 # намеренно ПРЕВЫСИТЬ compute стадии 1 ради дополнительной эффективной
 # глубины (собственно Astra-идея).
 N_REASONING_CYCLES = 4
+
+# ==========================================================================
+# ПАТЧ (deep supervision + smoothness): чистый "как у Astra" вариант --
+# ТОЛЬКО final-loss, без явного per-цикл сигнала -- уже был опробован
+# (300 шагов) и провалился: h1_probe_gdn2_100m_tied.py показал bpb,
+# МОНОТОННО РАСТУЩИЙ с r (2.80->4.17) и Phi_conv~=0.0000 на каждом шаге
+# (соседние состояния практически не коррелируют -- это drift/collapse
+# необученного механизма, ровно baseline из RESEARCH_LOG §3.5, а НЕ
+# emergent-прогрессия). При 100M/300-1500 шагов implicit-emergence в духе
+# Astra не набирает нужный бюджет -- нужен явный сигнал.
+#
+# Явного gold-step датасета у нас нет (byte-level enwik8, не CoT) --
+# поэтому вместо LOTUS gold-step берём deep supervision: ТОТ ЖЕ финальный
+# CE-таргет применяется к КАЖДОМУ промежуточному y_r (не только к y_R),
+# с весом, РАСТУЩИМ по r (не equal-weight!) -- equal-weight parallel
+# supervision на игрушке уже дала другой, но тоже нежелательный эффект
+# (§2.2: "реши сразу", accuracy плоская по глубине) -- растущий вес
+# минимизирует этот риск, отдавая приоритет последнему циклу.
+#
+# Плюс smoothness-штраф на ||y_r - y_{r-1}||^2 -- напрямую бьёт по
+# наблюдаемому Phi_conv~=0 (взрывной, не плавный переход между циклами).
+# ==========================================================================
+DEEP_SUPERVISION_ENABLED = True
+DEEP_SUPERVISION_WEIGHT_MODE = "linear_increasing"  # веса r/R, r=1..R
+SMOOTH_PENALTY_COEF = 1e-3   # маленький -- ведущий сигнал всё ещё CE, это только anti-explosion подстраховка
+READOUT_CLIP = 30.0
 
 CKPT_ROOT = "/kaggle/working/gdn2_100m_tied_full_ckpt"
 HF_ROOT = "gdn2_100m_tied_full"
@@ -141,6 +167,62 @@ def _try_copy_matching_shapes(target, source):
     return target
 
 
+def _readout_logits(y_r, embed_table):
+    """Логиты промежуточного/финального состояния через ту же embed_table
+    (tie_embeddings=True), БЕЗ дополнительной model-level RMSNorm -- та же
+    схема, что h1_probe_gdn2_100m_tied.py уже использовал для измерения
+    (числа получились содержательные: bpb 2.8..4.2), так что deep-
+    supervision оптимизирует ТУ ЖЕ величину, что мы уже умеем мерить."""
+    logits = jnp.einsum("bld,vd->blv", y_r.astype(jnp.float32), embed_table.astype(jnp.float32))
+    return jnp.nan_to_num(jnp.clip(logits, -READOUT_CLIP, READOUT_CLIP),
+                           nan=0.0, posinf=READOUT_CLIP, neginf=-READOUT_CLIP)
+
+
+def deep_supervision_bpb_loss(params, model, batch, deterministic, rngs=None):
+    """ПАТЧ: заменяет чистый final-only compute_bpb_loss для стадии 2.
+    Возвращает (total_loss, bpb_final, ce_weighted, smooth_pen) --
+    total_loss = то, что дифференцируется; bpb_final = bpb ПОСЛЕДНЕГО
+    цикла (r=R) -- это реальная метрика качества, которую мы логируем и
+    по которой решаем plateau/best_val (то, что модель реально отдаёт)."""
+    input_ids = batch["input_ids"]
+    labels = batch["labels"]
+    kwargs = {"deterministic": deterministic, "return_all_r_states": True}
+    if rngs is not None:
+        kwargs["rngs"] = rngs
+
+    r_states = model.apply({"params": params}, input_ids, **kwargs)
+    R = len(r_states)
+    embed_table = params["embed"]["embedding"]
+
+    ce_per_r = []
+    for y_r in r_states:
+        logits = _readout_logits(y_r, embed_table)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+        ce_per_r.append(jnp.mean(nll))
+    ce_stack = jnp.stack(ce_per_r)  # (R,)
+
+    if DEEP_SUPERVISION_WEIGHT_MODE == "linear_increasing":
+        weights = jnp.arange(1, R + 1, dtype=jnp.float32)
+    else:  # "equal" -- НЕ рекомендуется, см. §2.2 в докстринге выше, оставлено для A/B
+        weights = jnp.ones((R,), dtype=jnp.float32)
+    weights = weights / jnp.sum(weights)
+
+    ce_weighted = jnp.sum(ce_stack * weights)
+    ce_weighted = jnp.nan_to_num(ce_weighted, nan=0.0, posinf=20.0, neginf=0.0)
+
+    smooth_terms = []
+    for i in range(1, R):
+        delta = r_states[i].astype(jnp.float32) - r_states[i - 1].astype(jnp.float32)
+        smooth_terms.append(jnp.mean(jnp.sum(delta * delta, axis=-1)))
+    smooth_pen = jnp.mean(jnp.stack(smooth_terms)) if smooth_terms else jnp.asarray(0.0, dtype=jnp.float32)
+    smooth_pen = jnp.nan_to_num(smooth_pen, nan=0.0, posinf=1e6, neginf=0.0)
+
+    total_loss = ce_weighted + SMOOTH_PENALTY_COEF * smooth_pen
+    bpb_final = ce_stack[-1] / jnp.log(2.0)
+    return total_loss, bpb_final, ce_weighted, smooth_pen
+
+
 def fetch_stage1_params(mesh, micro_batch_size, seq_len):
     """Качает лучший (или, если его нет, последний) чекпоинт стадии 1 с HF,
     восстанавливает его под АБСТРАКТНОЙ формой untied-модели, затем
@@ -165,16 +247,19 @@ def fetch_stage1_params(mesh, micro_batch_size, seq_len):
         )
     print(f"[FETCH] ✅ Стадия 1: слот='{used_slot}', шаг={step}")
 
-    from model_gdn2_100m import FullGDN2BlockDeltaModel
     stage1_cfg = load_stage1_config()
-    stage1_model = FullGDN2BlockDeltaModel(cfg=stage1_cfg)
 
-    abstract_stage1_params = jax.eval_shape(
-        lambda: stage1_model.init(jax.random.PRNGKey(0), jnp.zeros((micro_batch_size, seq_len), dtype=jnp.int32))
-    )["params"]
-
+    # ПАТЧ (фикс): save_slot() пишет чекпоинт как {"params": ..., "opt_state": ...},
+    # а restore() раньше запрашивался только с ключом "params" -- orbax сверяет
+    # структуру restore-запроса со структурой НА ДИСКЕ и падает с
+    # "Source: MISSING" на opt_state, т.к. запрошенное дерево уже дереву на
+    # диске не соответствует (opt_state отсутствует в запросе). Нам не нужен
+    # opt_state стадии 1 вообще (стадия 2 инициализирует свой оптимизатор
+    # с нуля) -- проще всего восстановить БЕЗ явной target-структуры (orbax
+    # сам восстановит то, что реально лежит на диске, params+opt_state), а
+    # затем взять из результата только "params".
     mngr = ocp.CheckpointManager(STAGE1_LOCAL_DOWNLOAD_DIR, ocp.StandardCheckpointer())
-    raw = mngr.restore(step, args=ocp.args.StandardRestore({"params": abstract_stage1_params}))
+    raw = mngr.restore(step)
     stage1_params = raw["params"]
 
     replicate = NamedSharding(mesh, P())
@@ -317,11 +402,14 @@ def main():
 
     def train_micro_step(p, accum_grads, batch, rng):
         def loss_fn(param):
-            return compute_bpb_loss(param, model, batch, deterministic=False, rngs={"dropout": rng})
-        (ce_nats, bpb), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+            total_loss, bpb_final, ce_weighted, smooth_pen = deep_supervision_bpb_loss(
+                param, model, batch, deterministic=False, rngs={"dropout": rng}
+            )
+            return total_loss, (bpb_final, ce_weighted, smooth_pen)
+        (total_loss, (bpb_final, ce_weighted, smooth_pen)), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
         micro_grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree_util.tree_leaves(grads)))
         new_accum = jax.tree_util.tree_map(lambda a, g: a + g, accum_grads, grads)
-        return new_accum, ce_nats, bpb, micro_grad_norm
+        return new_accum, bpb_final, smooth_pen, micro_grad_norm
 
     compiled_train_micro = jax.jit(
         train_micro_step,
@@ -364,12 +452,18 @@ def main():
     )
 
     def val_step(p, batch):
-        return compute_bpb_loss(p, model, batch, deterministic=True)
+        # ФИКС: eval теперь считает bpb ТОЙ ЖЕ функцией, что training (deep
+        # supervision readout, r=R) -- иначе plateau/best_val сравнивал бы
+        # величину, отличную от той, что реально оптимизируется.
+        _total_loss, bpb_final, _ce_w, _smooth = deep_supervision_bpb_loss(
+            p, model, batch, deterministic=True
+        )
+        return bpb_final
 
     compiled_val = jax.jit(
         val_step,
         in_shardings=(param_sharding, {"input_ids": data_sharding, "labels": data_sharding}),
-        out_shardings=(NamedSharding(mesh, P()), NamedSharding(mesh, P())),
+        out_shardings=NamedSharding(mesh, P()),
     )
 
     mngr = ocp.CheckpointManager(
@@ -393,17 +487,20 @@ def main():
     nonfinite_window = deque(maxlen=cfg_run["nonfinite_window_size"])
     best_val_bpb = float("inf")
     last_ckpt_time = time.perf_counter()
-    _micro_bpb_acc, _micro_grad_norm_acc = [], []
+    _micro_bpb_acc, _micro_smooth_acc, _micro_grad_norm_acc = [], [], []
 
-    print(f"[TRAIN] 🚀 Старт СТАДИИ 2 (tied, 100% слоёв, R={model_cfg.n_reasoning_cycles}).")
+    print(f"[TRAIN] 🚀 Старт СТАДИИ 2 (tied, 100% слоёв, R={model_cfg.n_reasoning_cycles}, "
+          f"deep_supervision={DEEP_SUPERVISION_ENABLED}, weight_mode={DEEP_SUPERVISION_WEIGHT_MODE}, "
+          f"smooth_coef={SMOOTH_PENALTY_COEF}).")
 
     micro_step = 0
     while global_step < cfg_run["total_train_steps"]:
         batch = next(train_stream)
         global_rng, step_rng = jax.random.split(global_rng)
 
-        accum_grads, ce_nats, bpb, micro_grad_norm = compiled_train_micro(params, accum_grads, batch, step_rng)
+        accum_grads, bpb, smooth_pen, micro_grad_norm = compiled_train_micro(params, accum_grads, batch, step_rng)
         _micro_bpb_acc.append(float(jax.device_get(bpb)))
+        _micro_smooth_acc.append(float(jax.device_get(smooth_pen)))
         _micro_grad_norm_acc.append(float(jax.device_get(micro_grad_norm)))
         micro_step += 1
 
@@ -426,10 +523,12 @@ def main():
             window_ratio = sum(nonfinite_window) / len(nonfinite_window)
 
             mean_bpb = float(np.mean(_micro_bpb_acc))
-            _micro_bpb_acc, _micro_grad_norm_acc = [], []
+            mean_smooth = float(np.mean(_micro_smooth_acc))
+            _micro_bpb_acc, _micro_smooth_acc, _micro_grad_norm_acc = [], [], []
 
             print(f"[STAGE2 STEP {global_step}/{cfg_run['total_train_steps']}] "
-                  f"bpb={mean_bpb:.4f} lr={cur_lr:.2e} global_grad_norm={float(jax.device_get(global_norm)):.4f} "
+                  f"bpb(r=R)={mean_bpb:.4f} smooth_pen={mean_smooth:.4f} lr={cur_lr:.2e} "
+                  f"global_grad_norm={float(jax.device_get(global_norm)):.4f} "
                   f"finite={step_finite} nonfinite_window={window_ratio:.2%} "
                   f"lr_mult={current_lr_multiplier:.4f} cooldown={cooldown_counter}")
 
@@ -455,7 +554,7 @@ def main():
                 bpb_sum, n_done = 0.0, 0
                 for _ in range(cfg_run["eval_batches"]):
                     vb = next(vstream)
-                    _, vbpb = compiled_val(params, vb)
+                    vbpb = compiled_val(params, vb)
                     bpb_sum += float(jax.device_get(vbpb))
                     n_done += 1
                 val_bpb = bpb_sum / max(n_done, 1)
